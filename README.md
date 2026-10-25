@@ -16,7 +16,7 @@ A small, bounded starter pipeline for discovering AI/agent-systems papers, ranki
 
 - macOS, Python 3.11+
 - LM Studio with your Qwen 3.6 35B A3B model loaded
-- LM Studio local server running (usually `http://localhost:1234/v1`)
+- LM Studio local server running (usually `http://localhost:1235/v1`)
 - Internet access for public scholarly metadata and paper pages
 
 No paid model API is used. Public APIs/websites may rate-limit requests. Local inference is private to your machine, but search queries and HTTP requests go to external services.
@@ -37,7 +37,7 @@ Edit `.env` if your LM Studio port/model differs. Start the LM Studio server bef
 Check your local endpoint:
 
 ```bash
-curl http://localhost:1234/v1/models
+curl http://localhost:1235/v1/models
 ```
 
 The `model` setting in `.env` should match an ID returned by that command. If the server accepts any model name, use the model's served ID.

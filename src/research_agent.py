@@ -27,6 +27,37 @@ OUT = Path("outputs")
 HEADERS = {"User-Agent": "AgentResearchLab/0.1 (local research workflow)"}
 
 
+def resolve_output_dir(output_dir: str | None) -> Path:
+    """Resolve the output directory.
+
+    If *output_dir* is ``None``, create a unique timestamped run directory
+    under ``outputs/`` so that previous runs are never silently overwritten.
+    When *output_dir* is explicitly provided, use it directly (created if
+    necessary).  The caller is responsible for ensuring that re-running
+    against the same explicit directory will overwrite previous results.
+
+    Collision handling: if two processes start within the same second and
+    both attempt to create the same timestamped directory, a suffix
+    (``.1``, ``.2``, …) is appended until a unique directory is created.
+    """
+    base = OUT
+    base.mkdir(parents=True, exist_ok=True)
+    if output_dir is not None:
+        target = Path(output_dir).resolve()
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    run_dir = base / timestamp
+    # Collision-safe: append suffix if the timestamped directory already
+    # exists (e.g. two processes started within the same second).
+    suffix = 0
+    while run_dir.exists():
+        suffix += 1
+        run_dir = base / f"{timestamp}.{suffix}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
 def get_json(url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     response = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
     response.raise_for_status()
@@ -524,6 +555,22 @@ def _select_pages_with_budget(
     return selected, omitted
 
 
+def _normalize_text(text: str) -> str:
+    """Normalize text for comparison by removing line breaks and fixing hyphenated word wraps.
+
+    PDF extraction preserves line breaks and hyphenation (e.g., 'trajec-' followed by a newline
+    then 'tory'), but LLM models return cleaned quotes without these artifacts. This normalizer
+    handles both cases.
+    """
+    # Fix hyphenated word wraps at line boundaries: 'word-' + newline + 'rest' → 'wordrest'
+    text = re.sub(r"([a-zA-Z]+)-\n([a-zA-Z])", r"\1\2", text)
+    # Replace actual newline characters with spaces (soft line breaks in PDF)
+    text = text.replace("\n", " ")
+    # Collapse multiple spaces
+    text = re.sub(r" +", " ", text)
+    return text.strip()
+
+
 def _validate_fields(
     fields: dict[str, Any], pages_inspected: dict[int, str]
 ) -> dict[str, Any]:
@@ -531,14 +578,28 @@ def _validate_fields(
 
     On validation failure, preserves the original finding and evidence for auditability
     but sets status to 'uncertain'. Does not silently erase the original model output.
+
+    Accepts ``"evidence"`` (canonical key) or ``"e"`` (common model abbreviation).
     """
     if not isinstance(fields, dict):
         return {"finding": None, "evidence": None, "pages": None, "status": "uncertain"}
 
     finding = fields.get("finding")
-    evidence = fields.get("evidence")
+    # Accept both canonical "evidence" and common model abbreviation "e".
+    # Use "in" check to distinguish empty string from missing key.
+    if "evidence" in fields:
+        evidence = fields["evidence"]
+    elif "e" in fields:
+        evidence = fields["e"]
+    else:
+        evidence = None
     pages_cited = fields.get("pages")
     status = fields.get("status", "uncertain")
+
+    # Normalize unknown status values to uncertain (only "supported" and
+    # "not_found_in_inspected_text" are valid explicit statuses).
+    if status not in ("supported", "not_found_in_inspected_text"):
+        status = "uncertain"
 
     # Validate page citations
     if pages_cited and isinstance(pages_cited, list):
@@ -551,18 +612,42 @@ def _validate_fields(
             status = "uncertain"
             pages_cited = None
         else:
-            # Check evidence appears in source pages
-            if evidence and isinstance(evidence, str):
+            # Check evidence appears in source pages.
+            # Non-string or missing evidence cannot be verified — mark uncertain.
+            if evidence is not None and isinstance(evidence, str) and evidence:
+                # Normalize both evidence and page text to handle PDF extraction
+                # artifacts (line breaks, hyphenation) vs LLM-cleaned quotes.
+                normalized_evidence = _normalize_text(evidence)
                 verified = any(
-                    evidence in pages_inspected.get(pn, "") for pn in valid_pages
+                    normalized_evidence in _normalize_text(pages_inspected.get(pn, ""))
+                    for pn in valid_pages
                 )
                 if not verified:
                     # Evidence snippet not found in cited pages — mark uncertain
                     # but keep finding/evidence for auditability
                     status = "uncertain"
+                else:
+                    # Evidence verified in source — mark supported.
+                    # However, a verified quote without a finding is
+                    # just a quote without context; require a non-empty
+                    # finding for a supported status.
+                    if finding and str(finding).strip():
+                        status = "supported"
+                    else:
+                        # Missing or empty finding — uncertain regardless of evidence
+                        status = "uncertain"
+            else:
+                # No evidence, empty evidence, or non-string evidence — cannot verify
+                status = "uncertain"
             pages_cited = valid_pages
     elif pages_cited is None:
-        # Model did not cite pages — mark as uncertain
+        # Model did not cite pages — mark as uncertain (unless an explicit
+        # "not_found_in_inspected_text" status was provided by the model).
+        if status != "not_found_in_inspected_text":
+            status = "uncertain"
+        pages_cited = None
+    else:
+        # pages_cited is truthy but not a list (e.g. an integer) — reject
         status = "uncertain"
         pages_cited = None
 
@@ -660,9 +745,13 @@ IMPORTANT RULES:
   Do NOT imply the entire paper lacks the information.
 - Cite only page numbers that appear in the supplied excerpt.
   Validate that each evidence snippet actually appears in the corresponding page.
+- EVERY factual field MUST include a short verbatim evidence quote
+  copied directly from the excerpt, OR set status to "not_found_in_inspected_text".
+  Do NOT omit the evidence field. Use the exact key "evidence" (not "e").
 - Return valid JSON only. No reasoning or text outside the JSON.
 
-Return exactly this JSON structure:
+Return exactly this JSON structure. Every field must have "finding", "evidence",
+"pages", and "status" — do NOT use shortcuts or abbreviations:
 {{
   "research_question": {{
     "finding": "string or null",
@@ -670,20 +759,60 @@ Return exactly this JSON structure:
     "pages": [integer page numbers] or null,
     "status": "supported" | "not_found_in_inspected_text" | "uncertain"
   }},
-  "claimed_contribution": {{ ... same structure ... }},
-  "method": {{ ... same structure ... }},
-  "datasets": {{ ... same structure ... }},
-  "baselines": {{ ... same structure ... }},
-  "metrics": {{ ... same structure ... }},
+  "claimed_contribution": {{
+    "finding": "string or null",
+    "evidence": "short verbatim excerpt or null",
+    "pages": [integer page numbers] or null,
+    "status": "supported" | "not_found_in_inspected_text" | "uncertain"
+  }},
+  "method": {{
+    "finding": "string or null",
+    "evidence": "short verbatim excerpt or null",
+    "pages": [integer page numbers] or null,
+    "status": "supported" | "not_found_in_inspected_text" | "uncertain"
+  }},
+  "datasets": {{
+    "finding": "string or null",
+    "evidence": "short verbatim excerpt or null",
+    "pages": [integer page numbers] or null,
+    "status": "supported" | "not_found_in_inspected_text" | "uncertain"
+  }},
+  "baselines": {{
+    "finding": "string or null",
+    "evidence": "short verbatim excerpt or null",
+    "pages": [integer page numbers] or null,
+    "status": "supported" | "not_found_in_inspected_text" | "uncertain"
+  }},
+  "metrics": {{
+    "finding": "string or null",
+    "evidence": "short verbatim excerpt or null",
+    "pages": [integer page numbers] or null,
+    "status": "supported" | "not_found_in_inspected_text" | "uncertain"
+  }},
   "main_results": {{
     "finding": "string (explicitly author-reported) or null",
     "evidence": "short verbatim excerpt or null",
     "pages": [integer page numbers] or null,
     "status": "supported" | "not_found_in_inspected_text" | "uncertain"
   }},
-  "limitations": {{ ... same structure ... }},
-  "computational_cost": {{ ... same structure ... }},
-  "reproducibility": {{ ... same structure ... }}
+  "limitations": {{
+    "finding": "string or null",
+    "evidence": "short verbatim excerpt or null",
+    "pages": [integer page numbers] or null,
+    "status": "supported" | "not_found_in_inspected_text" | "uncertain"
+  }},
+  "computational_cost": {{
+    "finding": "string or null",
+    "evidence": "short verbatim excerpt or null",
+    "pages": [integer page numbers] or null,
+    "status": "supported" | "not_found_in_inspected_text" | "uncertain"
+  }},
+  "reproducibility": {{
+    "finding": "string or null",
+    "evidence": "short verbatim excerpt or null",
+    "pages": [integer page numbers] or null,
+    "status": "supported" | "not_found_in_inspected_text" | "uncertain"
+  }}
 }}
 
 PAPER TITLE: {title}
@@ -707,8 +836,10 @@ EXCERPT (page-selected, {len(selected)}/{total_pages} pages, {len(excerpt)} char
                     "content": (
                         "You are a conservative research analyst. "
                         "Return one valid JSON object only. No reasoning or "
-                        "text outside the JSON. Validate all cited page numbers "
-                        "exist in the supplied text."
+                        "text outside the JSON. Use the exact key \"evidence\" "
+                        "(not \"e\" or any abbreviation). Every field must include "
+                        "a short verbatim evidence quote from the excerpt, or set "
+                        "status to \"not_found_in_inspected_text\"."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -874,9 +1005,11 @@ Abstract: {(paper.get('abstract') or '')[:9000]}
     return result
 
 
-def write_outputs(papers: list[dict[str, Any]], queries: list[str]) -> None:
-    OUT.mkdir(exist_ok=True)
-    with (OUT / "papers.jsonl").open("w", encoding="utf-8") as f:
+def write_outputs(
+    papers: list[dict[str, Any]], queries: list[str], out_dir: Path
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with (out_dir / "papers.jsonl").open("w", encoding="utf-8") as f:
         for p in papers:
             f.write(json.dumps(p, ensure_ascii=False) + "\n")
 
@@ -884,7 +1017,7 @@ def write_outputs(papers: list[dict[str, Any]], queries: list[str]) -> None:
         "title", "year", "authors", "venue", "source_db", "relevance", "themes",
         "contribution", "method", "evidence_limits", "citation_count", "doi", "arxiv_id", "url"
     ]
-    with (OUT / "paper_matrix.csv").open("w", newline="", encoding="utf-8") as f:
+    with (out_dir / "paper_matrix.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
         for p in sorted(papers, key=lambda x: (x.get("relevance") or 0, x.get("year") or 0), reverse=True):
@@ -934,8 +1067,47 @@ def write_outputs(papers: list[dict[str, Any]], queries: list[str]) -> None:
         "5. Record exclusions and reasons, not just selected papers.",
         "",
     ]
-    (OUT / "research_map.md").write_text("\n".join(lines), encoding="utf-8")
+    (out_dir / "research_map.md").write_text("\n".join(lines), encoding="utf-8")
 
+
+
+def load_paper_by_arxiv_id(arxiv_id: str) -> dict[str, Any] | None:
+    """Load a cached paper record from ``outputs/papers.jsonl`` by exact arXiv ID.
+
+    Matches the normalised arXiv ID (lowercase, stripped) exactly — not by
+    substring.  Returns ``None`` when no matching record exists or when
+    multiple ambiguous matches exist.  Does not modify the source file.
+    """
+    papers_path = OUT / "papers.jsonl"
+    if not papers_path.exists():
+        return None
+
+    query_id = arxiv_id.lower().strip()
+    candidates: list[dict[str, Any]] = []
+    with papers_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            cached_arxiv = (record.get("arxiv_id") or "").lower().strip()
+            if cached_arxiv == query_id:
+                candidates.append(record)
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if len(candidates) > 1:
+        print(
+            f"  WARNING: {len(candidates)} records match arXiv ID "
+            f"'{arxiv_id}'.  Search-based lookup required to disambiguate."
+        )
+    # 0 matches or >1 ambiguous matches
+    return None
 
 
 def main() -> None:
@@ -945,8 +1117,18 @@ def main() -> None:
     parser.add_argument(
         "--query",
         action="append",
-        required=True,
-        help="Repeat to search multiple queries.",
+        required=False,
+        help="Repeat to search multiple queries (not used when --arxiv-id is set).",
+    )
+    parser.add_argument(
+        "--arxiv-id",
+        default=None,
+        help=(
+            "Process a single cached paper by exact arXiv ID (e.g. "
+            "'2610.01256').  Skips network search and loads the matching "
+            "record from ``outputs/papers.jsonl`` instead.  When "
+            "provided, ``--query`` is ignored."
+        ),
     )
     parser.add_argument(
         "--per-source",
@@ -969,35 +1151,75 @@ def main() -> None:
         action="store_true",
         help="Analyze cached full text with page-referenced, bounded queries.",
     )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help=(
+            "Output directory.  When omitted, a unique timestamped directory "
+            "is created under ``outputs/`` so that previous runs are never "
+            "silently overwritten.  When provided, that directory is used "
+            "directly (created if necessary)."
+        ),
+    )
 
     args = parser.parse_args()
+    out_dir = resolve_output_dir(args.output_dir)
     per_source = max(1, min(args.per_source, 50))
 
     all_papers: list[dict[str, Any]] = []
 
-    # 1. Search both sources.
-    for query in args.query:
-        print(f"[search] {query}")
+    # 1. Exact-ID mode: load from local metadata only.
+    if args.arxiv_id:
+        exact_id = args.arxiv_id.lower().strip()
+        if not re.fullmatch(r"\d{4}\.\d{4,5}", exact_id):
+            raise SystemExit(
+                f"Invalid arXiv ID '{exact_id}'. Expected format: XXXX.NNNNN "
+                "(e.g. 2610.01256)."
+            )
 
-        for fn in (search_openalex, search_arxiv):
-            try:
-                results = fn(query, per_source)
-                print(f"  {fn.__name__}: {len(results)} results")
+        cached = load_paper_by_arxiv_id(exact_id)
+        if cached is None:
+            raise SystemExit(
+                f"No cached record found for arXiv ID '{exact_id}'. "
+                "Run a search-based query first to create a cached record, "
+                "or provide a valid --query."
+            )
 
-                for paper in results:
-                    paper["matched_queries"] = [query]
+        # Ensure the record has the expected key fields for downstream processing.
+        cached.setdefault("matched_queries", [exact_id])
+        all_papers.append(cached)
+        print(f"[arxiv-id] Loaded cached record for {exact_id}")
 
-                all_papers.extend(results)
+    # 2. Search-based mode: query OpenAlex + arXiv APIs.
+    elif args.query:
+        for query in args.query:
+            print(f"[search] {query}")
 
-            except Exception as exc:
-                print(
-                    f"  WARNING: {fn.__name__} failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            for fn in (search_openalex, search_arxiv):
+                try:
+                    results = fn(query, per_source)
+                    print(f"  {fn.__name__}: {len(results)} results")
 
-            time.sleep(0.5)
+                    for paper in results:
+                        paper["matched_queries"] = [query]
 
-    # 2. Deduplicate before processing.
+                    all_papers.extend(results)
+
+                except Exception as exc:
+                    print(
+                        f"  WARNING: {fn.__name__} failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+                time.sleep(0.5)
+
+    else:
+        raise SystemExit(
+            "Either --query or --arxiv-id is required. "
+            "Use --query for network search, --arxiv-id for exact local lookup."
+        )
+
+    # 3. Deduplicate before processing.
     papers = dedupe(all_papers)
     print(f"[dedupe] {len(papers)} unique papers")
 
@@ -1009,8 +1231,8 @@ def main() -> None:
 
     # 3. Optionally download and extract full text.
     if args.full_text:
-        manifest_path = OUT / "fulltext_manifest.jsonl"
-        OUT.mkdir(parents=True, exist_ok=True)
+        manifest_path = out_dir / "fulltext_manifest.jsonl"
+        out_dir.mkdir(parents=True, exist_ok=True)
 
         with manifest_path.open("w", encoding="utf-8") as manifest:
             for i, paper in enumerate(papers, 1):
@@ -1078,8 +1300,8 @@ def main() -> None:
     # 5. Optionally analyze full text.
     if args.full_text_analyze:
         ft_client = None if args.skip_model else local_client()
-        analysis_path = OUT / "fulltext_analysis.jsonl"
-        OUT.mkdir(parents=True, exist_ok=True)
+        analysis_path = out_dir / "fulltext_analysis.jsonl"
+        out_dir.mkdir(parents=True, exist_ok=True)
 
         analyzed_count = 0
         with analysis_path.open("w", encoding="utf-8") as analysis_file:
@@ -1125,20 +1347,20 @@ def main() -> None:
         print(f"[full-text-analyze] Manifest: {analysis_path}")
 
     # 6. Write the existing research outputs.
-    write_outputs(papers, args.query)
+    write_outputs(papers, args.query or [], out_dir)
 
-    print("\nDone. Review outputs/research_map.md and outputs/paper_matrix.csv.")
+    print(f"\nDone. Review {out_dir / 'research_map.md'} and {out_dir / 'paper_matrix.csv'}.")
 
     if args.full_text:
         print(
             "Full-text extraction was attempted for each paper. "
-            "Check outputs/fulltext_manifest.jsonl for individual statuses."
+            f"Check {out_dir / 'fulltext_manifest.jsonl'} for individual statuses."
         )
 
     if args.full_text_analyze:
         print(
             "Full-text analysis was attempted for each paper with cached text. "
-            "Check outputs/fulltext_analysis.jsonl for individual results."
+            f"Check {out_dir / 'fulltext_analysis.jsonl'} for individual results."
         )
 
     print(

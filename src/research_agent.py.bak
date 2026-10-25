@@ -1,0 +1,313 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+import requests
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
+
+BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1").rstrip("/")
+API_KEY = os.getenv("LM_STUDIO_API_KEY", "lm-studio")
+MODEL = os.getenv("LM_STUDIO_MODEL", "")
+TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
+MAILTO = os.getenv("OPENALEX_MAILTO", "").strip()
+OUT = Path("outputs")
+HEADERS = {"User-Agent": "AgentResearchLab/0.1 (local research workflow)"}
+
+
+def get_json(url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    response = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
+    response.raise_for_status()
+    return response.json()
+
+
+def normalize_title(title: str) -> str:
+    return re.sub(r"\W+", " ", (title or "").lower()).strip()
+
+
+def search_openalex(query: str, per_source: int) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {
+        "search": query,
+        "per-page": min(per_source, 50),
+        "sort": "relevance_score:desc",
+        "select": "id,doi,title,publication_year,authorships,primary_location,biblio,cited_by_count,abstract_inverted_index,type",
+    }
+    if MAILTO:
+        params["mailto"] = MAILTO
+    data = get_json("https://api.openalex.org/works", params)
+    results = []
+    for item in data.get("results", []):
+        inverted = item.get("abstract_inverted_index") or {}
+        abstract = ""
+        if inverted:
+            words: dict[int, str] = {}
+            for word, positions in inverted.items():
+                for pos in positions:
+                    words[int(pos)] = word
+            abstract = " ".join(words[p] for p in sorted(words))
+        loc = item.get("primary_location") or {}
+        source = loc.get("source") or {}
+        authors = [
+            (a.get("author") or {}).get("display_name", "")
+            for a in (item.get("authorships") or [])[:8]
+        ]
+        results.append({
+            "source_db": "OpenAlex",
+            "title": item.get("title") or "",
+            "year": item.get("publication_year"),
+            "authors": authors,
+            "abstract": abstract,
+            "doi": item.get("doi"),
+            "url": loc.get("landing_page_url") or item.get("id") or "",
+            "venue": source.get("display_name") or "",
+            "citation_count": item.get("cited_by_count"),
+            "openalex_id": item.get("id"),
+            "arxiv_id": None,
+        })
+    return results
+
+
+def search_arxiv(query: str, per_source: int) -> list[dict[str, Any]]:
+    # arXiv API returns Atom XML. Parse it with Python's standard library.
+    import xml.etree.ElementTree as ET
+    url = "https://export.arxiv.org/api/query"
+    params = {
+        "search_query": f'all:"{query}"',
+        "start": 0,
+        "max_results": min(per_source, 50),
+        "sortBy": "relevance",
+        "sortOrder": "descending",
+    }
+    response = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
+    response.raise_for_status()
+    root = ET.fromstring(response.text)
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    results = []
+    for entry in root.findall("a:entry", ns):
+        link = entry.find("a:id", ns)
+        arxiv_url = link.text.strip() if link is not None and link.text else ""
+        match = re.search(r"abs/([^v/?]+)", arxiv_url)
+        arxiv_id = match.group(1) if match else None
+        title = " ".join((entry.findtext("a:title", default="", namespaces=ns)).split())
+        abstract = " ".join((entry.findtext("a:summary", default="", namespaces=ns)).split())
+        published = entry.findtext("a:published", default="", namespaces=ns)
+        authors = [a.findtext("a:name", default="", namespaces=ns) for a in entry.findall("a:author", ns)]
+        results.append({
+            "source_db": "arXiv",
+            "title": title,
+            "year": int(published[:4]) if published[:4].isdigit() else None,
+            "authors": authors[:8],
+            "abstract": abstract,
+            "doi": None,
+            "url": arxiv_url,
+            "venue": "arXiv preprint",
+            "citation_count": None,
+            "openalex_id": None,
+            "arxiv_id": arxiv_id,
+        })
+    return results
+
+
+def dedupe(papers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen = set()
+    unique = []
+    for p in papers:
+        key = (p.get("doi") or "").lower().strip()
+        if not key:
+            key = (p.get("arxiv_id") or "").lower().strip()
+        if not key:
+            key = normalize_title(p.get("title", ""))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(p)
+    return unique
+
+
+def local_client() -> OpenAI:
+    return OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=120.0, max_retries=1)
+
+
+def triage_paper(client: OpenAI, paper: dict[str, Any]) -> dict[str, Any]:
+    if not MODEL or MODEL.startswith("replace-with"):
+        raise RuntimeError("Set LM_STUDIO_MODEL in .env to the model ID returned by /v1/models.")
+    prompt = f"""
+You are a careful research librarian for agent systems. Assess this paper only from the supplied metadata and abstract.
+Do not claim to have read the full paper. Do not invent details or novelty.
+Return valid JSON only with keys:
+relevance (integer 1-5), themes (array of short strings), contribution (one sentence),
+method (one sentence or 'not clear from abstract'), evidence_limits (one sentence),
+follow_up_questions (array of up to 3 strings).
+A relevance of 5 means directly useful for research on agent reliability, evaluation, inference-time efficiency,
+adaptive harnesses, test-time learning, or theoretical principles of agents. Be selective.
+
+PAPER:
+Title: {paper.get('title')}
+Year: {paper.get('year')}
+Authors: {', '.join(paper.get('authors') or [])}
+Venue: {paper.get('venue')}
+Abstract: {(paper.get('abstract') or '')[:9000]}
+"""
+    response = client.chat.completions.create(
+        model=MODEL,
+        temperature=0,
+        max_tokens=1200,
+        reasoning_effort="none",
+        extra_body={
+            "chat_template_kwargs": {
+                "enable_thinking": False
+            }
+        },
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a conservative research assistant. "
+                    "Return one valid JSON object only. No reasoning or "
+                    "text outside the JSON."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+    )
+
+    content = response.choices[0].message.content or "{}"
+    content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.I)
+    try:
+        result = json.loads(content)
+    except json.JSONDecodeError:
+        result = {
+            "relevance": 1,
+            "themes": ["parse_error"],
+            "contribution": "Could not parse local-model output; inspect raw response.",
+            "method": "not clear from abstract",
+            "evidence_limits": "Triage output was not valid JSON.",
+            "follow_up_questions": [],
+            "raw_model_output": content[:2000],
+        }
+    return result
+
+
+def write_outputs(papers: list[dict[str, Any]], queries: list[str]) -> None:
+    OUT.mkdir(exist_ok=True)
+    with (OUT / "papers.jsonl").open("w", encoding="utf-8") as f:
+        for p in papers:
+            f.write(json.dumps(p, ensure_ascii=False) + "\n")
+
+    columns = [
+        "title", "year", "authors", "venue", "source_db", "relevance", "themes",
+        "contribution", "method", "evidence_limits", "citation_count", "doi", "arxiv_id", "url"
+    ]
+    with (OUT / "paper_matrix.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for p in sorted(papers, key=lambda x: (x.get("relevance") or 0, x.get("year") or 0), reverse=True):
+            row = dict(p)
+            row["authors"] = "; ".join(row.get("authors") or [])
+            row["themes"] = "; ".join((row.get("triage") or {}).get("themes") or [])
+            row["relevance"] = (row.get("triage") or {}).get("relevance", "")
+            for key in ("contribution", "method", "evidence_limits"):
+                row[key] = (row.get("triage") or {}).get(key, "")
+            writer.writerow(row)
+
+    ranked = sorted(papers, key=lambda x: (x.get("triage", {}).get("relevance", 0), x.get("year") or 0), reverse=True)
+    lines = [
+        "# Agent-systems research map",
+        "",
+        f"Generated: {datetime.now(timezone.utc).isoformat()}",
+        "",
+        "> **Evidence warning:** This report uses public metadata/abstracts and local-model triage. It is not a full-paper review, novelty proof, or peer-reviewed conclusion. Verify primary sources before relying on any claim.",
+        "",
+        "## Search queries",
+        *[f"- {q}" for q in queries],
+        "",
+        "## Highest-ranked papers",
+    ]
+    for p in ranked[:20]:
+        t = p.get("triage") or {}
+        lines += [
+            "",
+            f"### {p.get('title','Untitled')} ({p.get('year') or 'year unknown'})",
+            f"- **Relevance:** {t.get('relevance', 'unrated')}/5",
+            f"- **Source:** {p.get('url') or 'URL unavailable'}",
+            f"- **Authors:** {', '.join(p.get('authors') or []) or 'not listed'}",
+            f"- **Venue/database:** {p.get('venue') or p.get('source_db') or 'unknown'}",
+            f"- **Contribution (abstract-level):** {t.get('contribution', 'not extracted')}",
+            f"- **Method (abstract-level):** {t.get('method', 'not clear from abstract')}",
+            f"- **Limits:** {t.get('evidence_limits', 'not extracted')}",
+            f"- **Themes:** {', '.join(t.get('themes') or [])}",
+            f"- **Questions to check in the full paper:** {'; '.join(t.get('follow_up_questions') or []) or 'none extracted'}",
+        ]
+    lines += [
+        "",
+        "## Next manual verification steps",
+        "1. Open the highest-relevance primary papers and verify their actual methods, baselines, and limitations.",
+        "2. Check related work and papers that cite each candidate; search for contrary findings.",
+        "3. Mark which results are author-reported versus independently reproduced.",
+        "4. Do not claim a novelty gap until near-neighbor work has been checked.",
+        "5. Record exclusions and reasons, not just selected papers.",
+        "",
+    ]
+    (OUT / "research_map.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Bounded local-first agent-systems literature triage.")
+    parser.add_argument("--query", action="append", required=True, help="Repeat to search multiple queries.")
+    parser.add_argument("--per-source", type=int, default=10, help="Max results per query per database (1-50).")
+    parser.add_argument("--skip-model", action="store_true", help="Collect metadata without local-model triage.")
+    args = parser.parse_args()
+    per_source = max(1, min(args.per_source, 50))
+
+    client = None if args.skip_model else local_client()
+    all_papers: list[dict[str, Any]] = []
+    for query in args.query:
+        print(f"[search] {query}")
+        for fn in (search_openalex, search_arxiv):
+            try:
+                results = fn(query, per_source)
+                print(f"  {fn.__name__}: {len(results)} results")
+                for p in results:
+                    p["matched_queries"] = [query]
+                all_papers.extend(results)
+            except Exception as exc:
+                print(f"  WARNING: {fn.__name__} failed: {type(exc).__name__}: {exc}")
+            time.sleep(0.5)
+
+    papers = dedupe(all_papers)
+    print(f"[dedupe] {len(papers)} unique papers")
+    if not papers:
+        raise SystemExit("No papers collected. Check internet access/API availability and try fewer queries.")
+
+    for i, paper in enumerate(papers, 1):
+        if client:
+            try:
+                paper["triage"] = triage_paper(client, paper)
+                print(f"[triage {i}/{len(papers)}] {paper.get('triage', {}).get('relevance', '?')}/5 — {paper['title'][:80]}")
+            except Exception as exc:
+                paper["triage"] = {
+                    "relevance": 0, "themes": [], "contribution": "Triage failed.",
+                    "method": "unknown", "evidence_limits": str(exc), "follow_up_questions": []
+                }
+                print(f"[triage {i}/{len(papers)}] FAILED: {type(exc).__name__}: {exc}")
+        else:
+            paper["triage"] = {"relevance": 0, "themes": [], "contribution": "", "method": "", "evidence_limits": "Skipped", "follow_up_questions": []}
+
+    write_outputs(papers, args.query)
+    print("\nDone. Review outputs/research_map.md and outputs/paper_matrix.csv.")
+    print("Remember: abstract-level ranking is a filter, not a substitute for reading primary papers.")
+
+
+if __name__ == "__main__":
+    main()
