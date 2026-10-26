@@ -68,6 +68,14 @@ def normalize_title(title: str) -> str:
     return re.sub(r"\W+", " ", (title or "").lower()).strip()
 
 
+def _extract_arxiv_from_doi(doi: str | None) -> str | None:
+    """Extract an arXiv ID from a DOI when it references arXiv."""
+    if not doi:
+        return None
+    match = re.search(r"arxiv\.(\d{4}\.\d{4,5})", doi, re.I)
+    return match.group(1) if match else None
+
+
 def search_openalex(query: str, per_source: int) -> list[dict[str, Any]]:
     params: dict[str, Any] = {
         "search": query,
@@ -104,8 +112,8 @@ def search_openalex(query: str, per_source: int) -> list[dict[str, Any]]:
             "url": loc.get("landing_page_url") or item.get("id") or "",
             "venue": source.get("display_name") or "",
             "citation_count": item.get("cited_by_count"),
-            "openalex_id": item.get("id"),
-            "arxiv_id": None,
+            "openalex_id": item.get("id", "").split("/")[-1] if item.get("id") else None,
+            "arxiv_id": _extract_arxiv_from_doi(item.get("doi")),
         })
     return results
 
@@ -233,6 +241,10 @@ def dedupe(papers: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     elif field == "authors":
                         if len(value or []) > len(target.get(field) or []):
                             target[field] = value
+                    elif field == "matched_queries" and value:
+                        existing = set((target.get(field) or []))
+                        existing.update(value)
+                        target[field] = sorted(existing)
                     elif not target.get(field) and value:
                         target[field] = value
 
@@ -265,6 +277,10 @@ def dedupe(papers: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         or target.get(field) == "arXiv preprint"
                     ):
                         target[field] = value
+                elif field == "matched_queries" and value:
+                    existing = set((target.get(field) or []))
+                    existing.update(value)
+                    target[field] = sorted(existing)
                 elif not target.get(field) and value:
                     target[field] = value
 
