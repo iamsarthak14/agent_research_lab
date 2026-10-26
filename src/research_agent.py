@@ -291,6 +291,383 @@ def dedupe(papers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return unique
 
 
+# ---------------------------------------------------------------------------
+# Persistent corpus: pagination, batch screening, resumability
+# ---------------------------------------------------------------------------
+
+DEFAULT_MAX_RECORDS = 500  # Default max unique records (up to 10,000)
+
+
+def _corpus_path(corpus_dir: Path | None = None) -> Path:
+    """Return the persistent corpus file path."""
+    d = Path(corpus_dir) if corpus_dir else OUT
+    return d / "corpus.jsonl"
+
+
+def _corpus_status_path(corpus_dir: Path | None = None) -> Path:
+    """Return the persistent corpus status file path."""
+    d = Path(corpus_dir) if corpus_dir else OUT
+    return d / "corpus_status.json"
+
+
+def search_openalex_paginated(
+    query: str,
+    per_source: int,
+    max_records: int = DEFAULT_MAX_RECORDS,
+    cursor: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Search OpenAlex with cursor-based pagination.
+
+    Returns (results, next_cursor).  *next_cursor* is ``None`` when there
+    are no more pages.  Stops once *max_records* unique records are collected.
+    """
+    all_results: list[dict[str, Any]] = []
+    collected = 0
+    current_cursor = cursor
+
+    while collected < max_records:
+        params: dict[str, Any] = {
+            "search": query,
+            "per-page": min(per_source, 50),
+            "sort": "relevance_score:desc",
+            "select": "id,doi,title,publication_year,authorships,primary_location,biblio,cited_by_count,abstract_inverted_index,type",
+        }
+        if MAILTO:
+            params["mailto"] = MAILTO
+        if current_cursor:
+            params["cursor"] = current_cursor
+
+        try:
+            data = get_json("https://api.openalex.org/works", params)
+        except Exception:
+            break  # Network failure — return what we have
+
+        results = []
+        for item in data.get("results", []):
+            inverted = item.get("abstract_inverted_index") or {}
+            abstract = ""
+            if inverted:
+                words: dict[int, str] = {}
+                for word, positions in inverted.items():
+                    for pos in positions:
+                        words[int(pos)] = word
+                abstract = " ".join(words[p] for p in sorted(words))
+            loc = item.get("primary_location") or {}
+            source = loc.get("source") or {}
+            authors = [
+                (a.get("author") or {}).get("display_name", "")
+                for a in (item.get("authorships") or [])[:8]
+            ]
+            results.append({
+                "source_db": "OpenAlex",
+                "title": item.get("title") or "",
+                "year": item.get("publication_year"),
+                "authors": authors,
+                "abstract": abstract,
+                "doi": item.get("doi"),
+                "url": loc.get("landing_page_url") or item.get("id") or "",
+                "venue": source.get("display_name") or "",
+                "citation_count": item.get("cited_by_count"),
+                "openalex_id": item.get("id", "").split("/")[-1] if item.get("id") else None,
+                "arxiv_id": _extract_arxiv_from_doi(item.get("doi")),
+            })
+
+        all_results.extend(results)
+        collected += len(results)
+
+        # Cursor-based pagination: OpenAlex returns a cursor in 'next_cursor'
+        current_cursor = data.get("meta", {}).get("next_cursor")
+        if not current_cursor or len(data.get("results", [])) == 0:
+            break
+
+        time.sleep(0.5)  # Rate limit
+
+    return all_results, current_cursor
+
+
+def search_arxiv_paginated(
+    query: str,
+    per_source: int,
+    max_records: int = DEFAULT_MAX_RECORDS,
+    start: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    """Search arXiv with offset-based pagination.
+
+    Returns (results, next_start).  *next_start* indicates where the next
+    page should begin.  Stops once *max_records* total records are collected.
+    """
+    import xml.etree.ElementTree as ET
+
+    stopwords = {
+        "a", "an", "and", "for", "in", "of", "on", "or", "the",
+        "to", "with", "by", "from", "how", "do", "does",
+    }
+    terms = re.findall(r"[A-Za-z0-9-]+", query.lower())
+    terms = list(dict.fromkeys(
+        term for term in terms
+        if term not in stopwords and len(term) > 1
+    ))[:10]
+
+    if not terms:
+        return [], 0
+
+    search_query = " OR ".join(f"all:{term}" for term in terms)
+    all_results: list[dict[str, Any]] = []
+    collected = 0
+
+    while collected < max_records:
+        batch_size = min(per_source, 50)
+        remaining = max_records - collected
+
+        response = requests.get(
+            "https://export.arxiv.org/api/query",
+            params={
+                "search_query": search_query,
+                "start": start,
+                "max_results": min(batch_size, remaining),
+                "sortBy": "relevance",
+                "sortOrder": "descending",
+            },
+            headers=HEADERS,
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+
+        root = ET.fromstring(response.text)
+        ns = {"a": "http://www.w3.org/2005/Atom"}
+        page_results = []
+
+        for entry in root.findall("a:entry", ns):
+            arxiv_url = (
+                entry.findtext("a:id", default="", namespaces=ns).strip()
+            )
+            match = re.search(r"abs/([^v/?]+)", arxiv_url)
+            arxiv_id = match.group(1) if match else None
+
+            title = " ".join(
+                entry.findtext("a:title", default="", namespaces=ns).split()
+            )
+            abstract = " ".join(
+                entry.findtext("a:summary", default="", namespaces=ns).split()
+            )
+            published = entry.findtext(
+                "a:published", default="", namespaces=ns
+            )
+            authors = [
+                a.findtext("a:name", default="", namespaces=ns)
+                for a in entry.findall("a:author", ns)
+            ]
+
+            page_results.append({
+                "source_db": "arXiv",
+                "title": title,
+                "year": int(published[:4]) if published[:4].isdigit() else None,
+                "authors": authors[:8],
+                "abstract": abstract,
+                "doi": None,
+                "url": arxiv_url,
+                "venue": "arXiv preprint",
+                "citation_count": None,
+                "openalex_id": None,
+                "arxiv_id": arxiv_id,
+            })
+
+        all_results.extend(page_results)
+        collected += len(page_results)
+        start += len(page_results)
+
+        if len(page_results) == 0:
+            break  # No more results
+
+        time.sleep(0.5)  # Rate limit
+
+    return all_results, start
+
+
+def load_corpus(corpus_dir: Path | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load the persistent corpus and its run status.
+
+    Returns (papers, status).  *papers* is the deduplicated corpus.
+    *status* tracks completed queries and counts.
+    """
+    papers: list[dict[str, Any]] = []
+    corpus_path = _corpus_path(corpus_dir)
+
+    if corpus_path.exists():
+        for line in open(corpus_path, "r", encoding="utf-8"):
+            line = line.strip()
+            if line:
+                try:
+                    papers.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass  # Skip malformed lines
+
+    status: dict[str, Any] = {}
+    status_path = _corpus_status_path(corpus_dir)
+    if status_path.exists():
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return papers, status
+
+
+def save_corpus(papers: list[dict[str, Any]], corpus_dir: Path | None = None) -> None:
+    """Write the current corpus to disk (overwrite).
+
+    This is a full replace — call after deduplication.
+    """
+    corpus_path = _corpus_path(corpus_dir)
+    with corpus_path.open("w", encoding="utf-8") as f:
+        for p in papers:
+            f.write(json.dumps(p, ensure_ascii=False) + "\n")
+
+
+def save_corpus_status(status: dict[str, Any], corpus_dir: Path | None = None) -> None:
+    """Persist corpus run status (queries completed, counts)."""
+    status_path = _corpus_status_path(corpus_dir)
+    status_path.write_text(
+        json.dumps(status, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def batch_screen_abstracts(
+    papers: list[dict[str, Any]],
+    client: OpenAI | None,
+    batch_size: int = 10,
+    max_retries: int = 2,
+) -> list[dict[str, Any]]:
+    """Screen papers in batches using the local model with fallback.
+
+    For each paper, assigns relevance score, themes, contribution, method,
+    evidence_limits, and follow_up_questions.  If the model is unavailable
+    or returns malformed output, falls back to metadata-only scoring
+    (citation count + abstract length heuristic).
+
+    Retries up to *max_retries* times on failure per paper.
+    """
+    if client is None:
+        # Metadata-only fallback: score by citation count and abstract presence
+        for paper in papers:
+            paper["triage"] = {
+                "relevance": 0,
+                "themes": [],
+                "contribution": "Batch screening skipped (no model)",
+                "method": "unknown",
+                "evidence_limits": "Skipped",
+                "follow_up_questions": [],
+            }
+        return papers
+
+    for batch_start in range(0, len(papers), batch_size):
+        batch = papers[batch_start:batch_start + batch_size]
+        print(
+            f"[batch-screen] Processing batch "
+            f"{batch_start + 1}-{min(batch_start + batch_size, len(papers))}"
+            f" of {len(papers)}"
+        )
+
+        for i, paper in enumerate(batch):
+            success = False
+            for attempt in range(1 + max_retries):
+                try:
+                    # Reuse existing triage_paper for single papers
+                    triage_result = triage_paper(client, paper)
+
+                    # Validate structured output
+                    if not isinstance(triage_result, dict):
+                        raise ValueError(
+                            f"Expected dict, got {type(triage_result).__name__}"
+                        )
+                    required_keys = {"relevance", "themes", "contribution",
+                                    "method", "evidence_limits", "follow_up_questions"}
+                    if not required_keys.issubset(triage_result.keys()):
+                        missing = required_keys - set(triage_result.keys())
+                        raise ValueError(f"Missing keys: {missing}")
+
+                    paper["triage"] = triage_result
+                    success = True
+                    break
+
+                except Exception as exc:
+                    if attempt < max_retries:
+                        time.sleep(1.0 * (attempt + 1))  # Exponential backoff
+                        continue
+                    # Final failure: metadata-only fallback
+                    paper["triage"] = {
+                        "relevance": 0,
+                        "themes": [],
+                        "contribution": f"Batch screening failed: {exc}",
+                        "method": "unknown",
+                        "evidence_limits": str(exc),
+                        "follow_up_questions": [],
+                    }
+                    print(
+                        f"[batch-screen] FAILED: {type(exc).__name__}: {exc}"
+                    )
+
+    return papers
+
+
+def update_corpus_run_report(
+    discovered: int,
+    unique: int,
+    screened: int,
+    relevant: int,
+    full_text_acquired: int,
+    queries: list[str],
+    failures: list[str],
+    source_coverage: dict[str, int],
+    out_dir: Path,
+) -> Path:
+    """Write a run report to the corpus output directory.
+
+    Returns the path to the generated report.
+    """
+    report_path = out_dir / "corpus_run_report.md"
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    lines = [
+        "# Corpus Run Report",
+        "",
+        f"Generated: {timestamp}",
+        "",
+        "## Counts",
+        f"- **Discovered (raw):** {discovered}",
+        f"- **Unique (after dedup):** {unique}",
+        f"- **Screened:** {screened}",
+        f"- **Relevant:** {relevant}",
+        f"- **Full-text acquired:** {full_text_acquired}",
+        "",
+        "## Queries",
+    ]
+    for q in queries:
+        lines.append(f"- `{q}`")
+
+    lines += [
+        "",
+        "## Source coverage",
+    ]
+    for source, count in sorted(source_coverage.items()):
+        lines.append(f"- {source}: {count}")
+
+    if failures:
+        lines += ["", "## Failures", *[f"- {f}" for f in failures]]
+
+    lines += [
+        "",
+        "## Limitations",
+        "- Metadata and abstract-level screening is not a substitute for reading primary papers.",
+        "- Novelty claims require verification against the full literature, not just this corpus.",
+        "",
+    ]
+
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    return report_path
+
+
 def get_arxiv_pdf_url(paper: dict[str, Any]) -> str | None:
     """Return a PDF URL only when an arXiv identifier is available."""
     arxiv_id = str(paper.get("arxiv_id") or "").strip()
@@ -1177,15 +1554,136 @@ def main() -> None:
             "directly (created if necessary)."
         ),
     )
+    # New flags for persistent corpus
+    parser.add_argument(
+        "--max-records",
+        type=int,
+        default=DEFAULT_MAX_RECORDS,
+        help=(
+            f"Maximum number of unique records to collect across all queries "
+            f"and sources (default: {DEFAULT_MAX_RECORDS}, max: 10000).  "
+            f"When the corpus already contains records, this is the total "
+            f"unique-count ceiling."
+        ),
+    )
+    parser.add_argument(
+        "--batch-screen",
+        action="store_true",
+        help=(
+            "Screen the corpus in batches using the local model.  "
+            "Falls back to metadata-only scoring when the model is unavailable. "
+            "Respects existing triage results."
+        ),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10,
+        help="Number of papers per batch-screen batch (default: 10).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume a previous corpus run.  Reads the persistent corpus "
+            "and status file, skips queries already completed, and "
+            "appends new results.  Only meaningful with --query."
+        ),
+    )
+    parser.add_argument(
+        "--corpus-dir",
+        default=None,
+        help=(
+            "Directory for the persistent corpus files "
+            "(default: ``outputs/``).  The corpus file is "
+            "``<corpus-dir>/corpus.jsonl`` and the status "
+            "file is ``<corpus-dir>/corpus_status.json``."
+        ),
+    )
 
     args = parser.parse_args()
+
+    corpus_dir = Path(args.corpus_dir).resolve() if args.corpus_dir else OUT
+
     out_dir = resolve_output_dir(args.output_dir)
     per_source = max(1, min(args.per_source, 50))
+    max_records = max(1, min(args.max_records, 10000))
 
     all_papers: list[dict[str, Any]] = []
+    failures: list[str] = []
+    source_coverage: dict[str, int] = {}
 
-    # 1. Exact-ID mode: load from local metadata only.
-    if args.arxiv_id:
+    # --- Persistent corpus mode ---
+    if args.query and (args.resume or args.batch_screen):
+        existing_papers, run_status = load_corpus(corpus_dir)
+        print(
+            f"[corpus] Loaded {len(existing_papers)} existing records "
+            f"from persistent corpus"
+        )
+
+        queries = args.query
+        completed_queries: set[str] = set(run_status.get("completed_queries", []))
+        queries_to_run = [q for q in queries if q not in completed_queries]
+
+        print(
+            f"[corpus] {len(queries_to_run)} new queries to run "
+            f"({len(queries) - len(queries_to_run)} already completed)"
+        )
+
+        for query in queries_to_run:
+            print(f"[search] {query}")
+
+            for fn_name, fn in [("search_openalex", search_openalex_paginated),
+                                 ("search_arxiv", search_arxiv_paginated)]:
+                try:
+                    if fn_name == "search_openalex":
+                        results, next_cursor = fn(
+                            query, per_source, max_records,
+                            cursor=run_status.get("cursors", {}).get(query, {}).get("openalex")
+                        )
+                        # Save cursor for resume
+                        if "cursors" not in run_status:
+                            run_status["cursors"] = {}
+                        if query not in run_status["cursors"]:
+                            run_status["cursors"][query] = {}
+                        if next_cursor:
+                            run_status["cursors"][query]["openalex"] = next_cursor
+                        else:
+                            run_status["cursors"][query]["openalex"] = None
+                    else:
+                        last_start = run_status.get("positions", {}).get(query, {}).get("arxiv", 0)
+                        results, next_start = fn(
+                            query, per_source, max_records, start=last_start
+                        )
+                        if "positions" not in run_status:
+                            run_status["positions"] = {}
+                        if query not in run_status["positions"]:
+                            run_status["positions"][query] = {}
+                        run_status["positions"][query]["arxiv"] = next_start
+
+                    for paper in results:
+                        paper["matched_queries"] = [query]
+
+                    all_papers.extend(results)
+                    source_coverage[fn_name] = source_coverage.get(fn_name, 0) + len(results)
+                    print(f"  {fn_name}: {len(results)} results (next_cursor/position: {next_cursor if fn_name == 'search_openalex' else next_start})")
+
+                except Exception as exc:
+                    msg = f"{fn_name} for '{query}': {type(exc).__name__}: {exc}"
+                    failures.append(msg)
+                    print(f"  WARNING: {msg}")
+
+                time.sleep(0.5)
+
+            # Mark query as completed
+            completed_queries.add(query)
+            run_status["completed_queries"] = sorted(completed_queries)
+            save_corpus_status(run_status, corpus_dir)
+
+        print(f"[corpus] Collected {len(all_papers)} raw records from new queries")
+
+    # --- Original single-run mode (unchanged behavior) ---
+    elif args.arxiv_id:
         exact_id = args.arxiv_id.lower().strip()
         if not re.fullmatch(r"\d{4}\.\d{4,5}", exact_id):
             raise SystemExit(
@@ -1201,12 +1699,10 @@ def main() -> None:
                 "or provide a valid --query."
             )
 
-        # Ensure the record has the expected key fields for downstream processing.
         cached.setdefault("matched_queries", [exact_id])
         all_papers.append(cached)
         print(f"[arxiv-id] Loaded cached record for {exact_id}")
 
-    # 2. Search-based mode: query OpenAlex + arXiv APIs.
     elif args.query:
         for query in args.query:
             print(f"[search] {query}")
@@ -1220,12 +1716,12 @@ def main() -> None:
                         paper["matched_queries"] = [query]
 
                     all_papers.extend(results)
+                    source_coverage["legacy"] = source_coverage.get("legacy", 0) + len(results)
 
                 except Exception as exc:
-                    print(
-                        f"  WARNING: {fn.__name__} failed: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
+                    msg = f"{fn.__name__} for '{query}': {type(exc).__name__}: {exc}"
+                    failures.append(msg)
+                    print(f"  WARNING: {msg}")
 
                 time.sleep(0.5)
 
@@ -1237,7 +1733,7 @@ def main() -> None:
 
     # 3. Deduplicate before processing.
     papers = dedupe(all_papers)
-    print(f"[dedupe] {len(papers)} unique papers")
+    print(f"[dedupe] {len(papers)} unique papers from {len(all_papers)} raw records")
 
     if not papers:
         raise SystemExit(
@@ -1245,11 +1741,46 @@ def main() -> None:
             "and try fewer queries."
         )
 
+    # 3b. Optionally update persistent corpus.
+    if args.query and (args.resume or args.batch_screen):
+        # Merge new papers into existing corpus, deduplicate, and save
+        merged = existing_papers + all_papers
+        corpus_unique = dedupe(merged)
+        # Cap at max_records
+        if len(corpus_unique) > max_records:
+            corpus_unique = corpus_unique[:max_records]
+            print(f"[corpus] Capped at {max_records} unique records")
+        save_corpus(corpus_unique, corpus_dir)
+        print(f"[corpus] Saved {len(corpus_unique)} unique records to persistent corpus")
+
+        run_status["counts"] = {
+            "discovered": len(all_papers),
+            "unique": len(corpus_unique),
+        }
+        run_status["last_run"] = datetime.now(timezone.utc).isoformat()
+        save_corpus_status(run_status, corpus_dir)
+
+    # 3c. Batch screening (persistent corpus mode).
+    if args.batch_screen and (args.resume or args.query):
+        corpus_papers, _ = load_corpus(corpus_dir)
+        client = None if args.skip_model else local_client()
+        batch_screen_abstracts(
+            corpus_papers, client,
+            batch_size=args.batch_size,
+            max_retries=2,
+        )
+        save_corpus(corpus_papers, corpus_dir)
+        print(f"[batch-screen] Saved screened corpus ({len(corpus_papers)} records)")
+
+        # Use corpus papers for output
+        papers = corpus_papers
+
     # 3. Optionally download and extract full text.
     if args.full_text:
         manifest_path = out_dir / "fulltext_manifest.jsonl"
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        full_text_count = 0
         with manifest_path.open("w", encoding="utf-8") as manifest:
             for i, paper in enumerate(papers, 1):
                 result = extract_full_text(paper)
@@ -1272,6 +1803,8 @@ def main() -> None:
                     )
                     + "\n"
                 )
+                if result.get("status") in ("cached", "downloaded"):
+                    full_text_count += 1
 
         print(f"[full-text] Manifest: {manifest_path}")
 
@@ -1363,7 +1896,24 @@ def main() -> None:
         print(f"[full-text-analyze] Manifest: {analysis_path}")
 
     # 6. Write the existing research outputs.
-    write_outputs(papers, args.query or [], out_dir)
+    queries = args.query or []
+    write_outputs(papers, queries, out_dir)
+
+    # 7. Write corpus run report (persistent mode).
+    if args.query and (args.resume or args.batch_screen):
+        relevant = sum(1 for p in papers if (p.get("triage") or {}).get("relevance", 0) > 0)
+        report = update_corpus_run_report(
+            discovered=len(all_papers),
+            unique=len(papers),
+            screened=len(papers),
+            relevant=relevant,
+            full_text_acquired=full_text_count if args.full_text else 0,
+            queries=queries,
+            failures=failures,
+            source_coverage=source_coverage,
+            out_dir=out_dir,
+        )
+        print(f"[corpus] Run report: {report}")
 
     print(f"\nDone. Review {out_dir / 'research_map.md'} and {out_dir / 'paper_matrix.csv'}.")
 
@@ -1383,6 +1933,8 @@ def main() -> None:
         "Remember: abstract-level ranking is a filter, "
         "not a substitute for reading primary papers."
     )
+
+    # (No OUT patching is performed; corpus_dir is passed explicitly to corpus functions.)
 
 
 if __name__ == "__main__":
